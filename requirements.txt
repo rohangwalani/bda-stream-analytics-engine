@@ -4,3 +4,4 @@ matplotlib>=3.7.0
 pymongo>=4.5.0
 mmh3>=4.0.0
 bitarray>=2.8.0
+pytest>=7.0.0

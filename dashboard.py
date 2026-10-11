@@ -1,207 +1,157 @@
-import streamlit as st
+import sys
+from collections import Counter
+
 import pandas as pd
-import matplotlib.pyplot as plt
-import math
-import mmh3
-import random
-from bitarray import bitarray
-from datetime import datetime, timedelta
+import streamlit as st
 
-# --- CONFIGURATION ---
-st.set_page_config(page_title="Real-Time Stream Analytics Engine", layout="wide", page_icon="📊")
+from streamlib import PCSA, BloomFilter, CountMinSketch, HyperLogLog, generate_stream
+from streamlib.source import aggregate, load_events
 
-# --- LOCAL CACHE (Bypassing MongoDB Login to guarantee it works) ---
-@st.cache_data
-def generate_local_data():
-    num_records = 50000
-    data = []
-    base_users = [f"user_{i:05d}" for i in range(1, 32000)] # ~32k unique users
-    
-    for i in range(num_records):
-        if random.random() < 0.8:
-            user_id = random.choice(base_users)
-        else:
-            user_id = f"user_new_{i:05d}"
-            
-        record = {
-            "user_id": user_id,
-            "action": random.choice(["view", "click", "login", "purchase"]),
-            "page": random.choice(["/home", "/product", "/cart", "/checkout", "/about"])
-        }
-        data.append(record)
-    return data
+st.set_page_config(page_title="Stream Analytics Engine", layout="wide", page_icon="📊")
 
-collection_data = generate_local_data()
 
-def aggregate_actions():
-    counts = {}
-    for log in collection_data:
-        counts[log['action']] = counts.get(log['action'], 0) + 1
-    return [{"_id": k, "count": v} for k, v in counts.items()]
+@st.cache_data(show_spinner="Loading events...")
+def get_events(n, seed):
+    return load_events(n, seed)
 
-def aggregate_pages():
-    counts = {}
-    for log in collection_data:
-        counts[log['page']] = counts.get(log['page'], 0) + 1
-    sorted_counts = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-    return [{"_id": k, "count": v} for k, v in sorted_counts]
 
-# --- SIDEBAR NAVIGATION ---
-st.sidebar.title("Big Data Mini Project")
-st.sidebar.markdown("### Dashboard Modules")
-page = st.sidebar.radio("Select Experiment:", [
-    "1. MongoDB Analytics", 
-    "2. Bloom Filter Engine", 
-    "3. Memory Benchmarking", 
-    "4. Flajolet-Martin Algorithm"
+st.sidebar.title("Stream Analytics Engine")
+n_events = st.sidebar.select_slider("Stream length", [10000, 25000, 50000, 100000], value=50000)
+seed = st.sidebar.number_input("Random seed", 0, 10_000, 42)
+events, source = get_events(n_events, seed)
+st.sidebar.caption(f"Data source: **{source}**")
+
+page = st.sidebar.radio("Module", [
+    "1. Stream overview",
+    "2. Live stream processing",
+    "3. Bloom filter lab",
+    "4. Cardinality lab (FM vs HLL)",
+    "5. Heavy hitters (Count-Min)",
 ])
+user_ids = [e["user_id"] for e in events]
 
-# --- HELPER CLASSES ---
-class BloomFilter:
-    def __init__(self, expected_items, fp_probability):
-        self.fp_prob = fp_probability
-        self.size = int(-(expected_items * math.log(fp_probability)) / (math.log(2)**2))
-        self.hash_count = int((self.size / expected_items) * math.log(2))
-        self.bit_array = bitarray(self.size)
-        self.bit_array.setall(0)
-        
-    def add(self, item):
-        for i in range(self.hash_count):
-            digest = mmh3.hash(str(item), i) % self.size
-            self.bit_array[digest] = 1
-            
-    def check(self, item):
-        for i in range(self.hash_count):
-            digest = mmh3.hash(str(item), i) % self.size
-            if self.bit_array[digest] == 0:
-                return False
-        return True
+if page == "1. Stream overview":
+    st.title("📊 Stream overview")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Events", f"{len(events):,}")
+    c2.metric("Distinct users (exact)", f"{len(set(user_ids)):,}")
+    c3.metric("Time span", str(events[-1]["timestamp"] - events[0]["timestamp"]).split(".")[0])
 
-# --- PAGES ---
-if page == "1. MongoDB Analytics":
-    st.title("📊 Descriptive Analytics with MongoDB")
-    st.write("Using MongoDB's powerful **Aggregation Pipeline** to process and summarize Big Data streams efficiently on the database level.")
-    
-    st.metric("Total Web Logs Analyzed", f"{len(collection_data):,}")
     col1, col2 = st.columns(2)
-    
     with col1:
-        st.subheader("User Actions Distribution")
-        data = aggregate_actions()
-        df = pd.DataFrame(data).rename(columns={"_id": "Action", "count": "Count"})
-        fig, ax = plt.subplots()
-        ax.pie(df['Count'], labels=df['Action'], autopct='%1.1f%%', startangle=90, colors=['#ff9999','#66b3ff','#99ff99','#ffcc99'])
-        ax.axis('equal')
-        st.pyplot(fig)
-        
+        st.subheader("Actions")
+        st.bar_chart(pd.DataFrame(aggregate("action", events), columns=["action", "count"]).set_index("action"))
     with col2:
-        st.subheader("Most Popular Website Pages")
-        data2 = aggregate_pages()
-        df2 = pd.DataFrame(data2).rename(columns={"_id": "Page", "count": "Visits"})
-        fig2, ax2 = plt.subplots()
-        ax2.bar(df2['Page'], df2['Visits'], color='#3498db')
-        plt.xticks(rotation=45)
-        st.pyplot(fig2)
+        st.subheader("Pages")
+        st.bar_chart(pd.DataFrame(aggregate("page", events), columns=["page", "count"]).set_index("page"))
+    st.caption("Aggregations run as a MongoDB `$group` pipeline when connected, otherwise in Python.")
 
-elif page == "2. Bloom Filter Engine":
-    st.title("🛡️ Bloom Filter Duplicate Detection")
-    st.write("Detecting returning users in a real-time stream using an extremely memory-efficient bit array instead of a slow database index.")
-    
-    expected_users = st.slider("Expected Unique Users", 10000, 50000, 35000)
-    fp_rate = st.selectbox("Acceptable False Positive Rate", [0.1, 0.05, 0.01, 0.001])
-    
-    if st.button("Run Stream Analysis"):
-        bloom = BloomFilter(expected_items=expected_users, fp_probability=fp_rate)
-        st.info(f"Initialized Bit Array Size: **{bloom.size / 8 / 1024:.2f} KB** | Hash Functions: **{bloom.hash_count}**")
-        
-        progress_bar = st.progress(0)
-        unique = 0
-        duplicates = 0
-        
-        for i, log in enumerate(collection_data):
-            user_id = log["user_id"]
-            if bloom.check(user_id):
-                duplicates += 1
-            else:
-                bloom.add(user_id)
-                unique += 1
-            if i % 2500 == 0:
-                progress_bar.progress(i / len(collection_data))
-                
-        progress_bar.progress(1.0)
-        
-        col1, col2 = st.columns(2)
-        col1.metric("Estimated Unique Users (New)", f"{unique:,}")
-        col2.metric("Estimated Duplicates (Returning)", f"{duplicates:,}")
+    st.subheader("User activity is heavy-tailed (Zipf)")
+    freq = Counter(user_ids).most_common()
+    st.line_chart(pd.DataFrame({"events per user": [c for _, c in freq]}), x_label="user rank", y_label="events")
+    st.dataframe(pd.DataFrame(events[:200]), use_container_width=True, height=250)
 
-elif page == "3. Memory Benchmarking":
-    st.title("📈 Bloom Filter Memory vs. Accuracy Benchmark")
-    st.write("Analyzing the core Big Data trade-off: Memory Footprint vs False Positive Error Rate.")
-    
-    if st.button("Run Benchmark Simulation"):
-        rates = [0.1, 0.05, 0.01, 0.005, 0.001, 0.0001]
-        sizes_kb = [(BloomFilter(35000, r).size / 8 / 1024) for r in rates]
-            
-        fig, ax = plt.subplots(figsize=(10, 5))
-        ax.plot(sizes_kb, rates, marker='o', linestyle='-', color='red', linewidth=2, markersize=8)
-        ax.set_title("Memory vs False Positive Rate Trade-off", fontsize=14, fontweight='bold')
-        ax.set_xlabel("Memory Required (KB)", fontsize=12)
-        ax.set_ylabel("False Positive Probability", fontsize=12)
-        ax.grid(True, linestyle='--', alpha=0.7)
-        st.pyplot(fig)
+elif page == "2. Live stream processing":
+    st.title("⚡ Live stream processing")
+    st.write("Events are consumed in micro-batches. All sketches update in a single pass; the exact set is "
+             "kept only to show the ground truth.")
+    batch = st.slider("Micro-batch size", 500, 5000, 2000, step=500)
+    if st.button("▶ Start stream"):
+        pcsa, hll = PCSA(256), HyperLogLog(10)
+        bloom = BloomFilter(max(1, len(set(user_ids))), 0.01)
+        cms = CountMinSketch(epsilon=0.001, top_k=5)
+        exact, history, returning = set(), [], 0
 
-elif page == "4. Flajolet-Martin Algorithm":
-    st.title("🧮 Flajolet-Martin (PCSA) Cardinality Estimation")
-    st.write("Estimating the total number of unique users by hashing data into binary and counting the trailing zeros.")
-    
-    buckets = st.slider("Number of Buckets (Stochastic Averaging)", 64, 1024, 256, step=64)
-    
-    if st.button("Run Cardinality Estimation"):
-        progress_bar = st.progress(0)
-        
-        def count_trailing_zeros(n, max_bits):
-            if n == 0: return max_bits
-            count = 0
-            while (n & 1) == 0 and count < max_bits:
-                count += 1; n >>= 1
-            return count
+        m1, m2, m3, m4 = [col.empty() for col in st.columns(4)]
+        chart, table, bar = st.empty(), st.empty(), st.progress(0.0)
+        for start in range(0, len(user_ids), batch):
+            for uid in user_ids[start:start + batch]:
+                pcsa.add(uid)
+                hll.add(uid)
+                cms.add(uid)
+                returning += bloom.add(uid)
+                exact.add(uid)
+            processed = min(start + batch, len(user_ids))
+            history.append({"events": processed, "Exact": len(exact),
+                            "FM-PCSA": pcsa.estimate(), "HyperLogLog": hll.estimate()})
+            m1.metric("Events processed", f"{processed:,}")
+            m2.metric("Distinct (HLL)", f"{hll.estimate():,}", f"{(hll.estimate() - len(exact)) / len(exact):+.1%} vs exact")
+            m3.metric("Returning visits (Bloom)", f"{returning:,}")
+            m4.metric("Sketch memory", f"{(pcsa.memory_bytes + hll.memory_bytes + bloom.memory_bytes) / 1024:.1f} KB")
+            chart.line_chart(pd.DataFrame(history).set_index("events"))
+            table.dataframe(pd.DataFrame(cms.heavy_hitters(), columns=["Top users (Count-Min)", "est. events"]))
+            bar.progress(processed / len(user_ids))
 
-        max_trailing_zeros = [0] * buckets
-        actual_set = set()
-        
-        for i, log in enumerate(collection_data):
-            uid = log["user_id"]
-            actual_set.add(uid)
-            hash_val = mmh3.hash(str(uid), 0, signed=False)
-            k = int(math.log2(buckets))
-            bucket_idx = hash_val >> (32 - k)
-            mask = (1 << (32 - k)) - 1
-            remaining = hash_val & mask
-            zeros = count_trailing_zeros(remaining, 32 - k)
-            
-            if zeros > max_trailing_zeros[bucket_idx]:
-                max_trailing_zeros[bucket_idx] = zeros
-            if i % 2500 == 0:
-                progress_bar.progress(i / len(collection_data))
-                
-        progress_bar.progress(1.0)
-        
-        phi = 0.77351
-        avg_R = sum(max_trailing_zeros) / buckets
-        estimate = int((buckets / phi) * (2 ** avg_R))
-        actual = len(actual_set)
-        
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Actual Unique Users (Ground Truth)", f"{actual:,}")
-        col2.metric("FM Estimated Users", f"{estimate:,}")
-        accuracy = (1 - abs(actual - estimate) / actual) * 100
-        col3.metric("Estimation Accuracy", f"{accuracy:.2f}%")
-        
-        fig, ax = plt.subplots(figsize=(8,5))
-        bars = ax.bar(['Actual Count', 'Flajolet-Martin Estimate'], [actual, estimate], color=['#2c3e50', '#3498db'], width=0.5)
-        for bar in bars:
-            yval = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2, yval + 1000, int(yval), ha='center', va='bottom', fontsize=12)
-            
-        ax.set_ylim(0, max(actual, estimate) * 1.2)
-        st.pyplot(fig)
+elif page == "3. Bloom filter lab":
+    st.title("🛡️ Bloom filter lab")
+    distinct = len(set(user_ids))
+    c1, c2 = st.columns(2)
+    n = c1.slider("Expected distinct users (n)", 1000, 100000, min(100000, max(1000, distinct)), step=1000)
+    p = c2.select_slider("Target false-positive rate (p)", [0.1, 0.05, 0.01, 0.005, 0.001, 0.0001], value=0.01)
+    bloom = BloomFilter(n, p)
+    st.info(f"m = {bloom.size:,} bits (**{bloom.memory_bytes / 1024:.1f} KB**), k = **{bloom.hash_count}** hash functions")
+
+    exact, new, returning, false_ret = set(), 0, 0, 0
+    for uid in user_ids:
+        if bloom.add(uid):
+            returning += 1
+            false_ret += uid not in exact
+        else:
+            new += 1
+        exact.add(uid)
+    probes = [f"absent_{i}" for i in range(20000)]
+    measured = sum(x in bloom for x in probes) / len(probes)
+
+    a, b, c, d = st.columns(4)
+    a.metric("New users flagged", f"{new:,}", f"exact: {len(exact):,}", delta_color="off")
+    b.metric("Returning visits", f"{returning:,}")
+    c.metric("Measured FP rate", f"{measured:.3%}", f"theory {bloom.theoretical_fp_rate():.3%}", delta_color="off")
+    d.metric("Memory vs exact set", f"{bloom.memory_bytes / 1024:.0f} KB", f"set: {sys.getsizeof(exact) / 1024:.0f} KB+", delta_color="off")
+    if n < len(exact):
+        st.warning(f"n is smaller than the real number of distinct users ({len(exact):,}), so the filter is "
+                   "over-full and the FP rate exceeds the target. This is the classic sizing mistake.")
+
+    st.subheader("Memory vs false-positive trade-off")
+    rows = [{"target p": r, "memory (KB)": BloomFilter(n, r).memory_bytes / 1024} for r in
+            (0.1, 0.05, 0.01, 0.005, 0.001, 0.0005, 0.0001)]
+    st.line_chart(pd.DataFrame(rows).set_index("memory (KB)"))
+
+elif page == "4. Cardinality lab (FM vs HLL)":
+    st.title("🧮 Cardinality estimation: Flajolet-Martin vs HyperLogLog")
+    st.write("Each configuration is run over several independent streams so the error has a spread.")
+    runs = st.slider("Independent runs (seeds)", 1, 10, 5)
+    if st.button("Run comparison"):
+        rows = []
+        prog = st.progress(0.0)
+        for i, s in enumerate(range(seed, seed + runs)):
+            ids = [e["user_id"] for e in generate_stream(n_events, seed=s)]
+            true = len(set(ids))
+            for name, sketch in [(f"PCSA m={m}", PCSA(m)) for m in (64, 256, 1024)] + \
+                                [(f"HLL p={p}", HyperLogLog(p)) for p in (8, 10, 12)]:
+                for u in ids:
+                    sketch.add(u)
+                rows.append({"config": name, "memory (B)": sketch.memory_bytes,
+                             "error %": abs(sketch.estimate() - true) / true * 100,
+                             "expected SE %": sketch.standard_error * 100})
+            prog.progress((i + 1) / runs)
+        df = pd.DataFrame(rows).groupby("config", sort=False).agg(
+            memory_B=("memory (B)", "first"), mean_error=("error %", "mean"),
+            std_error=("error %", "std"), expected_SE=("expected SE %", "first"))
+        st.dataframe(df.round(2), use_container_width=True)
+        st.bar_chart(df["mean_error"])
+        st.caption("HLL reaches the same error as PCSA with far less memory (6-bit registers vs 32-bit bitmaps).")
+
+elif page == "5. Heavy hitters (Count-Min)":
+    st.title("🔥 Heavy hitters with Count-Min Sketch")
+    eps = st.select_slider("ε (error as a fraction of stream length)", [0.01, 0.005, 0.001, 0.0005], value=0.001)
+    cms = CountMinSketch(epsilon=eps, delta=0.01, top_k=10)
+    for u in user_ids:
+        cms.add(u)
+    exact = Counter(user_ids)
+    st.info(f"Sketch: {cms.depth} × {cms.width:,} counters = **{cms.memory_bytes / 1024:.1f} KB** · "
+            f"guarantee: overcount ≤ εN = {eps * len(user_ids):.0f} with prob ≥ 99%")
+    df = pd.DataFrame([{"user": u, "CMS estimate": c, "exact": exact[u], "overcount": c - exact[u]}
+                       for u, c in cms.heavy_hitters()])
+    st.dataframe(df, use_container_width=True)
+    recall = len({u for u, _ in exact.most_common(10)} & set(df.user)) / 10
+    st.metric("Top-10 recall vs exact", f"{recall:.0%}")

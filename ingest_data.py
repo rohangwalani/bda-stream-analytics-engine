@@ -1,71 +1,54 @@
+"""Load the synthetic clickstream into MongoDB Atlas.
+
+    set MONGO_URI=mongodb+srv://...      (Windows)   /  export MONGO_URI=... (Linux/macOS)
+    python ingest_data.py --events 50000
+"""
+import argparse
 import os
-import random
-from datetime import datetime, timedelta
-from pymongo import MongoClient
-from pymongo.errors import ConnectionFailure
+import sys
 
-# Configuration
-# Set MONGO_URI in your environment or replace with your connection string
-MONGO_URI = os.environ.get(
-    "MONGO_URI",
-    "mongodb+srv://<username>:<password>@cluster0.lljocca.mongodb.net/?retryWrites=true&w=majority"
-)
-DB_NAME = "bda_project"
-COLLECTION_NAME = "web_logs"
-NUM_RECORDS = 50000
+from pymongo import ASCENDING, MongoClient
+from pymongo.errors import PyMongoError
 
-def generate_dummy_data(num_records):
-    print(f"Generating {num_records} dummy web log records...")
-    data = []
-    base_users = [f"user_{i:05d}" for i in range(1, int(num_records * 0.6))]
-    start_time = datetime.now() - timedelta(days=7)
+from streamlib import generate_stream
+from streamlib.source import COLLECTION_NAME, DB_NAME
 
-    for i in range(num_records):
-        # 80% chance of returning user, 20% new user
-        if random.random() < 0.8:
-            user_id = random.choice(base_users)
-        else:
-            user_id = f"user_new_{i:05d}"
 
-        timestamp = start_time + timedelta(seconds=random.randint(0, 604800))
-        record = {
-            "log_id": f"log_{i}",
-            "user_id": user_id,
-            "timestamp": timestamp,
-            "action": random.choice(["view", "click", "login", "purchase"]),
-            "page": random.choice(["/home", "/product", "/cart", "/checkout", "/about"])
-        }
-        data.append(record)
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--events", type=int, default=50000)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--batch", type=int, default=5000)
+    args = parser.parse_args()
 
-    return data
-
-def insert_to_mongodb(data):
-    if "<username>" in MONGO_URI:
-        print("WARNING: Please set the MONGO_URI environment variable or update the connection string in the script.")
-        return
+    uri = os.environ.get("MONGO_URI", "")
+    if not uri or "<username>" in uri:
+        sys.exit("MONGO_URI is not set. Copy .env.example and export your Atlas connection string.")
 
     try:
-        print("Connecting to MongoDB...")
-        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-        client.admin.command('ping')
-        print("Connected successfully!")
+        client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+        client.admin.command("ping")
+        col = client[DB_NAME][COLLECTION_NAME]
+        col.delete_many({})
 
-        db = client[DB_NAME]
-        collection = db[COLLECTION_NAME]
+        batch, inserted = [], 0
+        for event in generate_stream(args.events, seed=args.seed):
+            batch.append(event)
+            if len(batch) == args.batch:
+                col.insert_many(batch, ordered=False)
+                inserted += len(batch)
+                batch = []
+                print(f"Inserted {inserted:,}/{args.events:,}")
+        if batch:
+            col.insert_many(batch, ordered=False)
+            inserted += len(batch)
 
-        collection.delete_many({})
-        print("Cleared existing collection.")
+        col.create_index([("timestamp", ASCENDING)])
+        col.create_index("user_id")
+        print(f"Done: {inserted:,} events in {DB_NAME}.{COLLECTION_NAME} (indexed on timestamp, user_id)")
+    except PyMongoError as e:
+        sys.exit(f"MongoDB error: {e}")
 
-        print(f"Inserting {len(data)} records...")
-        collection.insert_many(data)
-        print("Insertion complete!")
-        collection.create_index("user_id")
-
-    except ConnectionFailure as e:
-        print(f"Failed to connect to MongoDB: {e}")
-    except Exception as e:
-        print(f"An error occurred: {e}")
 
 if __name__ == "__main__":
-    records = generate_dummy_data(NUM_RECORDS)
-    insert_to_mongodb(records)
+    main()

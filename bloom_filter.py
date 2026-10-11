@@ -1,96 +1,50 @@
-import os
-import math
-import mmh3
-from bitarray import bitarray
-from pymongo import MongoClient
+"""Returning-visitor detection on the event stream with a Bloom filter.
 
-# Configuration
-MONGO_URI = os.environ.get(
-    "MONGO_URI",
-    "mongodb+srv://<username>:<password>@cluster0.lljocca.mongodb.net/?retryWrites=true&w=majority"
-)
-DB_NAME = "bda_project"
-COLLECTION_NAME = "web_logs"
+Compares against an exact Python set so false positives are measured, not assumed.
+Reads from MongoDB if MONGO_URI is set, otherwise from the local generator.
+"""
+import argparse
+import sys
 
-class BloomFilter:
-    def __init__(self, expected_items, fp_probability):
-        """
-        Initialize the Bloom filter.
-        :param expected_items: Expected number of items to be stored (n)
-        :param fp_probability: Desired false positive probability (p)
-        """
-        self.fp_prob = fp_probability
-        self.size = self._get_size(expected_items, fp_probability)
-        self.hash_count = self._get_hash_count(self.size, expected_items)
-        self.bit_array = bitarray(self.size)
-        self.bit_array.setall(0)
+from streamlib import BloomFilter
+from streamlib.source import load_events
 
-    def add(self, item):
-        """Add an item into the filter by setting k hash positions to 1."""
-        for i in range(self.hash_count):
-            digest = mmh3.hash(str(item), i) % self.size
-            self.bit_array[digest] = 1
 
-    def check(self, item):
-        """
-        Check if an item is present.
-        Returns False -> definitely not seen.
-        Returns True  -> probably seen (possible false positive).
-        """
-        for i in range(self.hash_count):
-            digest = mmh3.hash(str(item), i) % self.size
-            if self.bit_array[digest] == 0:
-                return False
-        return True
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--expected", type=int, default=20000, help="expected distinct users (n)")
+    parser.add_argument("--fp", type=float, default=0.01, help="target false-positive rate (p)")
+    args = parser.parse_args()
 
-    @classmethod
-    def _get_size(cls, n, p):
-        """Optimal bit array size: m = -(n * ln(p)) / (ln(2)^2)"""
-        m = -(n * math.log(p)) / (math.log(2) ** 2)
-        return int(m)
+    events, source = load_events()
+    print(f"Source: {source} ({len(events):,} events)")
 
-    @classmethod
-    def _get_hash_count(cls, m, n):
-        """Optimal number of hash functions: k = (m / n) * ln(2)"""
-        k = (m / n) * math.log(2)
-        return int(k)
+    bloom = BloomFilter(args.expected, args.fp)
+    print(f"Bloom filter: m={bloom.size:,} bits ({bloom.memory_bytes / 1024:.1f} KB), k={bloom.hash_count}\n")
 
-def run_bloom_filter_analytics():
-    print("Connecting to MongoDB...")
-    client = MongoClient(MONGO_URI)
-    db = client[DB_NAME]
-    collection = db[COLLECTION_NAME]
-
-    total_records = collection.count_documents({})
-    print(f"Found {total_records} logs in the database.\n")
-
-    bloom = BloomFilter(expected_items=35000, fp_probability=0.01)
-
-    print("Initialized Bloom Filter:")
-    print(f" - Bit Array Size: {bloom.size} bits ({bloom.size / 8 / 1024:.2f} KB)")
-    print(f" - Number of Hash Functions: {bloom.hash_count}")
-    print("\nProcessing streaming data...\n")
-
-    logs_cursor = collection.find().sort("timestamp", 1)
-
-    unique_count = 0
-    duplicate_count = 0
-
-    for i, log in enumerate(logs_cursor):
-        user_id = log["user_id"]
-        if bloom.check(user_id):
-            duplicate_count += 1
+    exact = set()
+    new_users = returning = false_returning = 0
+    for i, e in enumerate(events, 1):
+        uid = e["user_id"]
+        if bloom.add(uid):
+            returning += 1
+            if uid not in exact:
+                false_returning += 1  # filter said "seen" but user is actually new
         else:
-            bloom.add(user_id)
-            unique_count += 1
+            new_users += 1
+        exact.add(uid)
+        if i % 10000 == 0:
+            print(f"{i:>7,} events | new={new_users:,} returning={returning:,} | fill={bloom.fill_ratio:.1%}")
 
-        if (i + 1) % 10000 == 0:
-            print(f"Processed {i + 1} logs -> Found {unique_count} unique users, {duplicate_count} duplicates (estimated)")
+    print("\n--- Results ---")
+    print(f"Distinct users (exact):           {len(exact):,}")
+    print(f"New users flagged by Bloom:       {new_users:,}")
+    print(f"False 'returning' flags:          {false_returning:,} "
+          f"({false_returning / len(exact):.3%} of new users; target {args.fp:.2%})")
+    print(f"False negatives:                  0 (impossible by construction)")
+    print(f"Memory: Bloom {bloom.memory_bytes / 1024:.1f} KB vs exact set {sys.getsizeof(exact) / 1024:.1f} KB "
+          f"(set size excludes the strings themselves)")
 
-    print("\n--- Final Results (Bloom Filter) ---")
-    print(f"Total Logs Processed: {total_records}")
-    print(f"Estimated Unique Users: {unique_count}")
-    print(f"Estimated Duplicate Logs (Returning Visitors): {duplicate_count}")
 
 if __name__ == "__main__":
-    run_bloom_filter_analytics()
+    main()
