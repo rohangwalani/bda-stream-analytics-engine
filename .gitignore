@@ -1,0 +1,20 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Output artifacts
+*.log
+console_output.txt
+
+# OS metadata
+.DS_Store
+Thumbs.db
